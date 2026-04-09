@@ -1,10 +1,13 @@
+from django.contrib.auth import logout
+from rest_framework.authtoken.models import Token
+from rest_framework_simplejwt.exceptions import TokenError
+import logging
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.http import HttpResponse
 from django.utils.encoding import force_bytes
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
-
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -32,9 +35,42 @@ User = get_user_model()
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def register_view(request):
+    #
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-    user = serializer.save()
+
+    email = serializer.validated_data.get("email")
+    username = serializer.validated_data.get("username")
+
+    # Check for existing users
+    existing_errors = {}
+
+    if User.objects.filter(email=email).exists():
+        existing_errors["email"] = "A user with this email address already exists."
+
+    if User.objects.filter(username=username).exists():
+        existing_errors["username"] = "A user with this username already exists."
+
+    if existing_errors:
+        return Response(
+            {
+                "error": "Registration failed.",
+                "errors": existing_errors,
+                "message": "Please correct the errors and try again.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        user = serializer.save()
+    except IntegrityError:
+        return Response(
+            {
+                "error": "Unable to create user. Please try again.",
+                "message": "There was an issue creating your account.",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     # Make sure user is inactive until verified
     user.is_active = False
@@ -47,13 +83,25 @@ def register_view(request):
         f"/useraccount/account-confirm-email/{uid}/{token}/"
     )
 
-    send_mail(
-        subject="Verify your email",
-        message=f"Click the link to verify your email:\n{verification_link}",
-        from_email=None,
-        recipient_list=[user.email],
-        fail_silently=False,
-    )
+    # email send to user
+    try:
+        send_mail(
+            subject="Verify your email",
+            message=f"Click the link to verify your email:\n{verification_link}",
+            from_email=None,
+            recipient_list=[user.email],
+            fail_silently=False,
+        )
+    except Exception as e:
+        # If email fails to send, delete the user to avoid inactive accounts
+        user.delete()
+        return Response(
+            {
+                "error": "Failed to send verification email.",
+                "message": "Please try registering again.",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
     return Response(
         {
@@ -113,7 +161,7 @@ def verify_email_view(request):
 
     uidb64 = serializer.validated_data["uidb64"]
     token = serializer.validated_data["token"]
-
+    # check if user exists in db
     try:
         uid = urlsafe_base64_decode(uidb64).decode()
         user = User.objects.get(pk=uid)
@@ -128,7 +176,7 @@ def verify_email_view(request):
             {"message": "Account already verified"},
             status=status.HTTP_200_OK,
         )
-
+    # activate user
     if email_verification_token.check_token(user, token):
         user.is_active = True
         user.save()
@@ -179,7 +227,7 @@ def resend_email_verification_view(request):
     serializer.is_valid(raise_exception=True)
 
     email = serializer.validated_data["email"]
-
+    # check if user exists in db
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
@@ -200,7 +248,7 @@ def resend_email_verification_view(request):
     verification_link = request.build_absolute_uri(
         f"/useraccount/account-confirm-email/{uid}/{token}/"
     )
-
+    # resend email for verification
     send_mail(
         subject="Resend Email Verification",
         message=f"Click the link to verify your email:\n{verification_link}",
@@ -223,9 +271,9 @@ def resend_email_verification_view(request):
 def password_reset_view(request):
     serializer = PasswordResetSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-
+    # email validation
     email = serializer.validated_data["email"]
-
+    # check if user exists in db
     try:
         user = User.objects.get(email=email)
     except User.DoesNotExist:
@@ -276,10 +324,10 @@ def password_reset_confirm_redirect(request, uidb64, token):
 def password_reset_confirm_view(request):
     serializer = PasswordResetConfirmSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
-
+    # validating user
     user = serializer.validated_data["user"]
     new_password = serializer.validated_data["new_password"]
-
+    # setting the new password
     user.set_password(new_password)
     user.save()
 
@@ -325,6 +373,66 @@ def change_password_view(request):
         {"message": "Password changed successfully"},
         status=status.HTTP_200_OK,
     )
+
+
+logger = logging.getLogger(__name__)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def logout_view(request):
+    """
+    Logout user by:
+    1. Deleting auth token (if using Token authentication)
+    2. Blacklisting refresh token (if using JWT)
+    3. Clearing session (if using Session authentication)
+    """
+    response_data = {
+        "message": "Successfully logged out.",
+        "status": "success",
+        "details": [],
+    }
+
+    try:
+        # 1. Handle Token authentication
+        try:
+            if hasattr(request.user, "auth_token"):
+                request.user.auth_token.delete()
+                response_data["details"].append("Token deleted")
+        except Exception as e:
+            logger.warning(f"Could not delete token: {str(e)}")
+
+        # 2. Handle JWT token blacklisting
+        refresh_token = request.data.get("refresh_token")
+        if refresh_token:
+            try:
+                token = RefreshToken(refresh_token)
+                token.blacklist()
+                response_data["details"].append("Refresh token blacklisted")
+            except TokenError as e:
+                response_data["details"].append(f"JWT error: {str(e)}")
+            except Exception as e:
+                logger.warning(f"Could not blacklist token: {str(e)}")
+
+        # 3. Handle Session logout
+        try:
+            logout(request)
+            response_data["details"].append("Session cleared")
+        except Exception as e:
+            logger.warning(f"Could not clear session: {str(e)}")
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        logger.error(f"Logout error: {str(e)}")
+        return Response(
+            {
+                "error": "Failed to logout.",
+                "message": "An unexpected error occurred.",
+                "status": "error",
+            },
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 # =========================
